@@ -10,7 +10,7 @@ Date: 2025-11-14
 # ============================================================================
 # INSTALLATION (Run in Colab)
 # ============================================================================
-# !pip install lightgbm optuna shap pandas openpyxl scikit-learn matplotlib seaborn
+# !pip install lightgbm optuna shap pandas openpyxl scikit-learn matplotlib seaborn imbalanced-learn
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -35,6 +35,11 @@ from sklearn.metrics import (
     roc_auc_score, roc_curve, auc
 )
 from sklearn.preprocessing import label_binarize
+from sklearn.utils.class_weight import compute_class_weight
+
+# Imbalanced-learn for SMOTE
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
 
 # Optuna for hyperparameter optimization
 import optuna
@@ -100,6 +105,45 @@ def load_and_preprocess_data(file_path):
     dropped_rows = initial_rows - len(df_filtered)
     print(f"✓ Dropped {dropped_rows} rows with missing values ({len(df_filtered)} remaining)")
 
+    # ========================================================================
+    # FEATURE ENGINEERING: Add critical biomarker ratios
+    # ========================================================================
+    print(f"\n--- Feature Engineering ---")
+
+    # Aβ42/Aβ40 ratio - Gold standard biomarker for AD
+    # Lower ratio indicates AD pathology
+    df_filtered['abeta42_40_ratio'] = df_filtered['csf_abeta42_value'] / (df_filtered['csf_abeta40_value'] + 1e-10)
+    print("✓ Added Aβ42/Aβ40 ratio (gold standard AD biomarker)")
+
+    # Tau/Aβ42 ratio - Discriminates AD from CN/MCI
+    # Higher ratio indicates AD pathology
+    df_filtered['tau_abeta42_ratio'] = df_filtered['csf_tau_value'] / (df_filtered['csf_abeta42_value'] + 1e-10)
+    print("✓ Added Tau/Aβ42 ratio (discriminates AD from CN/MCI)")
+
+    # pTau/Tau ratio - Indicates phosphorylation state
+    # Helps distinguish MCI from CN
+    df_filtered['ptau_tau_ratio'] = df_filtered['csf_ptau_value'] / (df_filtered['csf_tau_value'] + 1e-10)
+    print("✓ Added pTau/Tau ratio (helps distinguish MCI from CN)")
+
+    # pTau/Aβ42 ratio - Another important discriminator
+    df_filtered['ptau_abeta42_ratio'] = df_filtered['csf_ptau_value'] / (df_filtered['csf_abeta42_value'] + 1e-10)
+    print("✓ Added pTau/Aβ42 ratio")
+
+    # Total biomarker burden (sum of pathological markers)
+    df_filtered['biomarker_burden'] = (
+        df_filtered['csf_tau_value'] +
+        df_filtered['csf_ptau_value'] -
+        df_filtered['csf_abeta42_value'] * 0.01  # Scale down Aβ42 as it's inversely related
+    )
+    print("✓ Added biomarker burden score")
+
+    # Update feature list with engineered features
+    engineered_features = [
+        'abeta42_40_ratio', 'tau_abeta42_ratio', 'ptau_tau_ratio',
+        'ptau_abeta42_ratio', 'biomarker_burden'
+    ]
+    all_features = FEATURE_COLUMNS + engineered_features
+
     # Check class distribution
     print(f"\n--- Target Distribution ---")
     class_counts = df_filtered[TARGET_COLUMN].value_counts()
@@ -107,7 +151,7 @@ def load_and_preprocess_data(file_path):
         print(f"  {label}: {count} ({count/len(df_filtered)*100:.1f}%)")
 
     # Encode target labels
-    X = df_filtered[FEATURE_COLUMNS].values
+    X = df_filtered[all_features].values
     y = df_filtered[TARGET_COLUMN].values
 
     label_encoder = LabelEncoder()
@@ -126,16 +170,17 @@ def load_and_preprocess_data(file_path):
     print(f"\n✓ Train-test split (stratified):")
     print(f"  Training set: {X_train.shape[0]} samples")
     print(f"  Test set: {X_test.shape[0]} samples")
+    print(f"✓ Total features: {len(all_features)} ({len(FEATURE_COLUMNS)} original + {len(engineered_features)} engineered)")
     print("=" * 70)
 
-    return X_train, X_test, y_train, y_test, label_encoder, FEATURE_COLUMNS
+    return X_train, X_test, y_train, y_test, label_encoder, all_features
 
 
 # ============================================================================
 # HYPERPARAMETER TUNING WITH OPTUNA
 # ============================================================================
 
-def objective(trial, X_train, y_train, n_classes):
+def objective(trial, X_train, y_train, n_classes, class_weights_dict):
     """
     Optuna objective function for hyperparameter optimization.
 
@@ -144,11 +189,12 @@ def objective(trial, X_train, y_train, n_classes):
         X_train: Training features
         y_train: Training labels
         n_classes: Number of classes
+        class_weights_dict: Dictionary of class weights
 
     Returns:
         float: Mean cross-validation score
     """
-    # Define hyperparameter search space (HEAVY configuration)
+    # Define hyperparameter search space (OPTIMIZED for MCI/CN separation)
     params = {
         'objective': 'multiclass',
         'num_class': n_classes,
@@ -157,37 +203,54 @@ def objective(trial, X_train, y_train, n_classes):
         'verbosity': -1,
         'random_state': RANDOM_SEED,
         'device': 'gpu' if os.system('nvidia-smi > /dev/null 2>&1') == 0 else 'cpu',
+        'class_weight': class_weights_dict,  # Add class weighting
+        'is_unbalance': True,  # Handle class imbalance
 
-        # Tree structure
-        'num_leaves': trial.suggest_int('num_leaves', 31, 255),
-        'max_depth': trial.suggest_int('max_depth', 12, 30),
+        # Tree structure - More conservative to prevent overfitting
+        'num_leaves': trial.suggest_int('num_leaves', 20, 100),  # Reduced from 31-255
+        'max_depth': trial.suggest_int('max_depth', 5, 15),  # Reduced from 12-30
 
         # Learning parameters
-        'learning_rate': trial.suggest_float('learning_rate', 0.001, 0.05, log=True),
-        'n_estimators': trial.suggest_int('n_estimators', 500, 3000, step=100),
+        'learning_rate': trial.suggest_float('learning_rate', 0.005, 0.1, log=True),
+        'n_estimators': trial.suggest_int('n_estimators', 300, 2000, step=100),
 
-        # Regularization
-        'min_child_samples': trial.suggest_int('min_child_samples', 10, 60),
-        'min_child_weight': trial.suggest_float('min_child_weight', 1e-5, 1e-1, log=True),
-        'lambda_l1': trial.suggest_float('lambda_l1', 1e-3, 10.0, log=True),
-        'lambda_l2': trial.suggest_float('lambda_l2', 1e-3, 10.0, log=True),
+        # Stronger regularization for MCI/CN separation
+        'min_child_samples': trial.suggest_int('min_child_samples', 20, 100),  # Increased from 10-60
+        'min_child_weight': trial.suggest_float('min_child_weight', 1e-3, 1.0, log=True),
+        'lambda_l1': trial.suggest_float('lambda_l1', 0.1, 50.0, log=True),  # Stronger L1
+        'lambda_l2': trial.suggest_float('lambda_l2', 0.1, 50.0, log=True),  # Stronger L2
 
         # Sampling
-        'feature_fraction': trial.suggest_float('feature_fraction', 0.7, 1.0),
-        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.7, 1.0),
+        'feature_fraction': trial.suggest_float('feature_fraction', 0.6, 0.95),
+        'bagging_fraction': trial.suggest_float('bagging_fraction', 0.6, 0.95),
         'bagging_freq': trial.suggest_int('bagging_freq', 1, 7),
 
         # Advanced parameters
-        'min_split_gain': trial.suggest_float('min_split_gain', 0.0, 1.0),
+        'min_split_gain': trial.suggest_float('min_split_gain', 0.01, 1.5),  # Require more gain to split
         'path_smooth': trial.suggest_float('path_smooth', 0.0, 1.0),
     }
 
-    # Cross-validation
+    # Apply SMOTE for class balancing
+    smote = SMOTE(random_state=RANDOM_SEED, k_neighbors=3)
+
+    # Cross-validation with SMOTE
     model = LGBMClassifier(**params)
     cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_SEED)
-    scores = cross_val_score(model, X_train, y_train, cv=cv, scoring='accuracy', n_jobs=-1)
 
-    return scores.mean()
+    scores = []
+    for train_idx, val_idx in cv.split(X_train, y_train):
+        X_train_fold, X_val_fold = X_train[train_idx], X_train[val_idx]
+        y_train_fold, y_val_fold = y_train[train_idx], y_train[val_idx]
+
+        # Apply SMOTE only on training fold
+        X_train_resampled, y_train_resampled = smote.fit_resample(X_train_fold, y_train_fold)
+
+        # Train and evaluate
+        model.fit(X_train_resampled, y_train_resampled)
+        score = model.score(X_val_fold, y_val_fold)
+        scores.append(score)
+
+    return np.mean(scores)
 
 
 def optimize_hyperparameters(X_train, y_train, n_classes):
@@ -200,12 +263,26 @@ def optimize_hyperparameters(X_train, y_train, n_classes):
         n_classes: Number of classes
 
     Returns:
-        dict: Best hyperparameters
+        dict: Best hyperparameters, best CV score, class weights
     """
     print("\n" + "=" * 70)
     print("HYPERPARAMETER OPTIMIZATION (OPTUNA)")
     print("=" * 70)
-    print(f"Running {N_OPTUNA_TRIALS} trials with {CV_FOLDS}-fold cross-validation...")
+
+    # Compute class weights to handle imbalance
+    print("\n--- Computing Class Weights ---")
+    class_weights = compute_class_weight(
+        class_weight='balanced',
+        classes=np.unique(y_train),
+        y=y_train
+    )
+    class_weights_dict = {i: weight for i, weight in enumerate(class_weights)}
+
+    print("Class weights (to handle MCI/CN imbalance):")
+    for class_idx, weight in class_weights_dict.items():
+        print(f"  Class {class_idx}: {weight:.3f}")
+
+    print(f"\nRunning {N_OPTUNA_TRIALS} trials with {CV_FOLDS}-fold cross-validation...")
     print("This may take several minutes...\n")
 
     # Create Optuna study
@@ -216,7 +293,7 @@ def optimize_hyperparameters(X_train, y_train, n_classes):
 
     # Optimize
     study.optimize(
-        lambda trial: objective(trial, X_train, y_train, n_classes),
+        lambda trial: objective(trial, X_train, y_train, n_classes, class_weights_dict),
         n_trials=N_OPTUNA_TRIALS,
         show_progress_bar=True,
         n_jobs=1  # LightGBM already uses parallelization
@@ -236,11 +313,13 @@ def optimize_hyperparameters(X_train, y_train, n_classes):
         'verbosity': -1,
         'random_state': RANDOM_SEED,
         'device': 'gpu' if os.system('nvidia-smi > /dev/null 2>&1') == 0 else 'cpu',
+        'class_weight': class_weights_dict,
+        'is_unbalance': True,
     })
 
     print("\n--- Best Parameters ---")
     for key, value in sorted(best_params.items()):
-        if key not in ['objective', 'num_class', 'metric', 'boosting_type', 'verbosity', 'random_state', 'device']:
+        if key not in ['objective', 'num_class', 'metric', 'boosting_type', 'verbosity', 'random_state', 'device', 'class_weight', 'is_unbalance']:
             print(f"  {key}: {value}")
     print("=" * 70)
 
@@ -253,7 +332,7 @@ def optimize_hyperparameters(X_train, y_train, n_classes):
 
 def train_final_model(X_train, y_train, best_params):
     """
-    Train final model with best hyperparameters.
+    Train final model with best hyperparameters and SMOTE.
 
     Args:
         X_train: Training features
@@ -261,19 +340,37 @@ def train_final_model(X_train, y_train, best_params):
         best_params: Best hyperparameters from Optuna
 
     Returns:
-        LGBMClassifier: Trained model
+        LGBMClassifier: Trained model, resampled training data
     """
     print("\n" + "=" * 70)
     print("TRAINING FINAL MODEL")
     print("=" * 70)
 
-    model = LGBMClassifier(**best_params)
-    model.fit(X_train, y_train)
+    # Apply SMOTE to balance classes (especially MCI/CN)
+    print("\n--- Applying SMOTE for Class Balancing ---")
+    print(f"Original training set size: {X_train.shape[0]}")
+    print("Original class distribution:")
+    unique, counts = np.unique(y_train, return_counts=True)
+    for class_idx, count in zip(unique, counts):
+        print(f"  Class {class_idx}: {count} samples")
 
-    print("✓ Model training complete!")
+    smote = SMOTE(random_state=RANDOM_SEED, k_neighbors=3)
+    X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+
+    print(f"\nResampled training set size: {X_train_resampled.shape[0]}")
+    print("Resampled class distribution:")
+    unique, counts = np.unique(y_train_resampled, return_counts=True)
+    for class_idx, count in zip(unique, counts):
+        print(f"  Class {class_idx}: {count} samples")
+
+    # Train model on resampled data
+    model = LGBMClassifier(**best_params)
+    model.fit(X_train_resampled, y_train_resampled)
+
+    print("\n✓ Model training complete!")
     print("=" * 70)
 
-    return model
+    return model, X_train_resampled
 
 
 # ============================================================================
@@ -697,8 +794,8 @@ def main(data_file_path):
     # 2. Hyperparameter optimization
     best_params, best_cv_score = optimize_hyperparameters(X_train, y_train, n_classes)
 
-    # 3. Train final model
-    model = train_final_model(X_train, y_train, best_params)
+    # 3. Train final model with SMOTE
+    model, X_train_resampled = train_final_model(X_train, y_train, best_params)
 
     # 4. Evaluate model
     metrics = evaluate_model(model, X_test, y_test, label_encoder, best_cv_score, best_params)
